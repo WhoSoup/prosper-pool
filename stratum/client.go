@@ -75,7 +75,7 @@ func NewClient(username, minername, password, invitecode, payoutaddress, version
 	c.currentTarget = 0xfffe000000000000
 	c.requestsMade = make(map[int32]func(Response))
 
-	successChannel := make(chan *mining.Winner, 100)
+	successChannel := make(chan *mining.Winner, 250)
 	c.successes = successChannel
 
 	go c.ListenForSuccess()

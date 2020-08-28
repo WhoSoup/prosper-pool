@@ -11,18 +11,28 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"os/user"
+	"path/filepath"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
+	"unsafe"
 
 	lxr "github.com/pegnet/LXRHash"
 	log "github.com/sirupsen/logrus"
 	"go.uber.org/ratelimit"
 )
 
+const BatchSize = 8388608
+const BuffSize = 12 * 2048
+
 // LX holds an instance of lxrhash
 var LX lxr.LXRHash
 var lxInitializer sync.Once
+var dll syscall.Handle
+var dll_set_base uintptr
+var dll_hash uintptr
 
 // The init function for LX is expensive. So we should explicitly call the init if we intend
 // to use it. Make the init call idempotent
@@ -36,6 +46,46 @@ func InitLX() {
 			LX.Init(lxr.Seed, lxr.MapSizeBits, lxr.HashSize, lxr.Passes)
 		}
 	})
+
+	u, err := user.Current()
+	if err != nil {
+		log.WithError(err).Errorf("getting user.Current")
+		return
+	}
+	path := filepath.Join(u.HomeDir, ".lxrhash", fmt.Sprintf("lxrhash-seed-%x-passes-%d-size-%d.dat", lxr.Seed, lxr.Passes, lxr.MapSizeBits))
+	testdll, err := syscall.LoadLibrary("hash.dll")
+	if err != nil {
+		log.WithError(err).Errorf("loading dll")
+		return
+	}
+
+	alloc_proc, err := syscall.GetProcAddress(testdll, "h_alloc_bytemap")
+	if err != nil {
+		log.WithError(err).Errorf("allocating bytemap")
+		return
+	}
+
+	var nargs uintptr = 1
+	r, _, err := syscall.Syscall(uintptr(alloc_proc), nargs, uintptr(unsafe.Pointer(syscall.StringBytePtr(path))), 0, 0)
+	if r != 1 {
+		log.WithError(err).Errorf("alloc_proc")
+		return
+	}
+
+	base_proc, err := syscall.GetProcAddress(testdll, "h_set_base")
+	if err != nil {
+		log.WithError(err).Error("proc address set base")
+		return
+	}
+
+	dll_set_base = base_proc
+
+	hash_proc, err := syscall.GetProcAddress(testdll, "h_hash")
+	if err != nil {
+		log.WithError(err).Error("proc address hash")
+		return
+	}
+	dll_hash = hash_proc
 }
 
 const (
@@ -184,6 +234,12 @@ func (p *PegnetMiner) resetStatic() {
 	p.MiningState.static = make([]byte, len(p.MiningState.oprhash)+len(p.MiningState.Prefix()))
 	i := copy(p.MiningState.static, p.MiningState.oprhash)
 	copy(p.MiningState.static[i:], p.MiningState.Prefix())
+
+	var nargs uintptr = 2
+	var length uint32 = uint32(len(p.MiningState.static))
+	syscall.Syscall(uintptr(dll_set_base), nargs, uintptr(unsafe.Pointer(&p.MiningState.static[0])), uintptr(length), 0)
+	log.Infof("new base set: %x", p.MiningState.static)
+
 }
 
 func (p *PegnetMiner) MineBatch(ctx context.Context, batchsize int) {
@@ -198,6 +254,13 @@ func (p *PegnetMiner) MineBatch(ctx context.Context, batchsize int) {
 		mineLog.Debugf("Mining init cancelled for miner %d\n", p.ID)
 		return // Cancelled
 	}
+
+	var count uint32
+	var buf [BuffSize]byte
+
+	blockSize := 1024
+	numBlocks := (BatchSize + blockSize - 1) / blockSize
+	var nargs uintptr = 6
 
 	for {
 		select {
@@ -219,41 +282,31 @@ func (p *PegnetMiner) MineBatch(ctx context.Context, batchsize int) {
 			continue
 		}
 
-		batch := make([][]byte, batchsize)
+		syscall.Syscall6(uintptr(dll_hash), nargs, uintptr(blockSize), uintptr(numBlocks), uintptr(p.MiningState.start), uintptr(p.MiningState.minimumDifficulty), uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&count)))
 
-		for i := range batch {
-			batch[i] = make([]byte, 4)
-			binary.BigEndian.PutUint32(batch[i], p.MiningState.start+uint32(i))
-		}
-		p.MiningState.start += uint32(batchsize)
+		p.MiningState.start += BatchSize
 		if p.MiningState.start > limit {
 			mineLog.Warnf("repeating nonces, hit the cycle's limit")
 		}
+		p.MiningState.stats.TotalHashes += BatchSize
 
-		var results [][]byte
-		results = LX.HashParallel(p.MiningState.static, batch)
-		for i := range results {
-			// do something with the result here
-			// nonce = batch[i]
-			// input = append(base, batch[i]...)
-			// hash = results[i]
-			h := results[i]
-
-			diff := ComputeHashDifficulty(h)
+		for i := uint32(0); i < count; i++ {
+			bufpos := i * 12
+			nonce := buf[bufpos : bufpos+4]
+			diff := ComputeHashDifficulty(buf[bufpos+4 : bufpos+12])
 			p.MiningState.stats.NewDifficulty(diff)
-			p.MiningState.stats.TotalHashes++
 
 			if diff > p.MiningState.minimumDifficulty {
 				success := &Winner{
 					OPRHash: hex.EncodeToString(p.MiningState.oprhash),
-					Nonce:   hex.EncodeToString(append(p.MiningState.static[32:], batch[i]...)),
+					Nonce:   hex.EncodeToString(append(p.MiningState.static[32:], nonce...)),
 					Target:  fmt.Sprintf("%x", diff),
 				}
 				p.MiningState.stats.TotalSubmissions++
 				select {
 				case p.successes <- success:
 					mineLog.WithFields(log.Fields{
-						"nonce":        batch[i],
+						"nonce":        nonce,
 						"id":           p.ID,
 						"staticPrefix": p.MiningState.static[32:],
 						"target":       success.Target,
