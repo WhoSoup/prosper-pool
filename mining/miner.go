@@ -24,8 +24,8 @@ import (
 	"go.uber.org/ratelimit"
 )
 
-const BatchSize = 8388608
-const BuffSize = 12 * 2048
+const BatchSize = 1048576
+const BuffSize = 8 * 1024
 
 // LX holds an instance of lxrhash
 var LX lxr.LXRHash
